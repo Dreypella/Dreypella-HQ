@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { getDatabase } from '../database/connection.js'
+import {
+  assertCanCreateTask,
+  assertCanReadTask,
+  assertCanUpdateTask,
+  taskReadScope,
+} from './task-access-service.js'
 
 const priorities = new Set(['low', 'normal', 'high', 'urgent'])
 
@@ -19,7 +25,6 @@ function requiredText(value, field, maxLength) {
   if (typeof value !== 'string' || !value.trim() || value.trim().length > maxLength) {
     throw new TypeError(`${field} must be a non-empty string of at most ${maxLength} characters.`)
   }
-
   return value.trim()
 }
 
@@ -27,11 +32,7 @@ function validateActor(actor) {
   if (!actor || !['system', 'human', 'ai_employee'].includes(actor.type)) {
     throw new TypeError('Actor type must be system, human or ai_employee.')
   }
-
-  return {
-    type: actor.type,
-    id: requiredText(actor.id, 'Actor ID', 120),
-  }
+  return { type: actor.type, id: requiredText(actor.id, 'Actor ID', 120) }
 }
 
 function recordEvent(db, taskId, actor, action, previousStatus, newStatus, details) {
@@ -41,16 +42,29 @@ function recordEvent(db, taskId, actor, action, previousStatus, newStatus, detai
       previous_status, new_status, details_json, occurred_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    randomUUID(),
-    taskId,
-    actor.type,
-    actor.id,
-    action,
-    previousStatus,
-    newStatus,
-    JSON.stringify(details),
+    randomUUID(), taskId, actor.type, actor.id, action,
+    previousStatus, newStatus, JSON.stringify(details),
     new Date().toISOString(),
   )
+}
+
+function readTask(id) {
+  const db = getDatabase()
+  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id)
+  if (!task) return null
+
+  const events = db.prepare(`
+    SELECT id, actor_type, actor_id, action, previous_status,
+      new_status, details_json, occurred_at
+    FROM task_events
+    WHERE task_id = ?
+    ORDER BY occurred_at ASC, rowid ASC
+  `).all(id).map(event => ({
+    ...event,
+    details: JSON.parse(event.details_json),
+  }))
+
+  return { ...task, events }
 }
 
 export function createTask(input) {
@@ -65,13 +79,12 @@ export function createTask(input) {
   const department = requiredText(input.department, 'Department', 120)
   const createdBy = requiredText(input.createdBy, 'Created by', 120)
   const actor = validateActor(input.actor)
-
   const priority = input.priority ?? 'normal'
   if (!priorities.has(priority)) throw new TypeError('Invalid task priority.')
 
-  const assignedEmployee = input.assignedEmployee == null
-    ? null
-    : requiredText(input.assignedEmployee, 'Assigned employee', 120)
+  if (input.assignedEmployee != null) {
+    throw new TypeError('Task assignment must use the authorised assignment workflow.')
+  }
 
   const dueAt = input.dueAt ?? null
   if (dueAt !== null && (typeof dueAt !== 'string' || !Number.isFinite(Date.parse(dueAt)))) {
@@ -79,109 +92,103 @@ export function createTask(input) {
   }
 
   const db = getDatabase()
+  const departmentRecord = db.prepare(`
+    SELECT id, name, code
+    FROM departments
+    WHERE lower(id) = lower(?)
+      OR lower(code) = lower(?)
+      OR lower(name) = lower(?)
+    LIMIT 1
+  `).get(department, department, department)
+
+  if (!departmentRecord) throw new TypeError('Select a valid registered department.')
+  assertCanCreateTask(departmentRecord.id, input.identity)
+
   const id = randomUUID()
   const now = new Date().toISOString()
-  const status = assignedEmployee ? 'assigned' : 'queued'
 
   db.exec('BEGIN IMMEDIATE')
   try {
     db.prepare(`
       INSERT INTO tasks (
-        id, title, description, department, assigned_employee,
-        created_by, priority, status, due_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, title, description, department, department_id,
+        assigned_employee, created_by, priority, status,
+        due_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'queued', ?, ?, ?)
     `).run(
-      id, title, description, department, assignedEmployee,
-      createdBy, priority, status, dueAt, now, now,
+      id, title, description, departmentRecord.name, departmentRecord.id,
+      createdBy, priority, dueAt, now, now,
     )
 
     recordEvent(
-      db, id, actor, 'task_created', null, status,
-      { title, department, priority, assignedEmployee },
+      db, id, actor, 'task_created', null, 'queued',
+      { title, department: departmentRecord.name, departmentId: departmentRecord.id, priority },
     )
-
     db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')
     throw error
   }
 
-  return getTask(id)
+  return readTask(id)
 }
 
-export function transitionTask(taskId, nextStatus, actorInput, details = {}) {
+export function transitionTask(taskId, nextStatus, actorInput, identity, details = {}) {
   const id = requiredText(taskId, 'Task ID', 120)
   const actor = validateActor(actorInput)
 
   if (!Object.hasOwn(transitions, nextStatus)) {
     throw new TypeError('Invalid task status.')
   }
-
   if (!details || typeof details !== 'object' || Array.isArray(details)) {
     throw new TypeError('Task event details must be an object.')
   }
 
   const db = getDatabase()
   db.exec('BEGIN IMMEDIATE')
-
   try {
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id)
     if (!task) throw new Error('Task not found.')
+
+    assertCanUpdateTask(task, identity)
 
     if (!transitions[task.status].includes(nextStatus)) {
       throw new Error(`Transition from ${task.status} to ${nextStatus} is not allowed.`)
     }
 
     const now = new Date().toISOString()
-
     db.prepare(`
       UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
     `).run(nextStatus, now, id)
 
-    recordEvent(
-      db, id, actor, 'status_changed',
-      task.status, nextStatus, details,
-    )
-
+    recordEvent(db, id, actor, 'status_changed', task.status, nextStatus, details)
     db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')
     throw error
   }
 
-  return getTask(id)
+  return readTask(id)
 }
 
-export function getTask(taskId) {
+export function getTask(taskId, identity) {
   const id = requiredText(taskId, 'Task ID', 120)
-  const db = getDatabase()
-  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id)
-
+  const task = readTask(id)
   if (!task) return null
-
-  const events = db.prepare(`
-    SELECT id, actor_type, actor_id, action, previous_status,
-           new_status, details_json, occurred_at
-    FROM task_events
-    WHERE task_id = ?
-    ORDER BY occurred_at ASC, rowid ASC
-  `).all(id).map(event => ({
-    ...event,
-    details: JSON.parse(event.details_json),
-  }))
-
-  return { ...task, events }
+  assertCanReadTask(task, identity)
+  return task
 }
 
-export function listTasks(filters = {}) {
+export function listTasks(filters = {}, identity) {
   const db = getDatabase()
-  const conditions = []
-  const values = []
+  const scope = taskReadScope(identity)
+  const conditions = [`(${scope.sql})`]
+  const values = [...scope.params]
 
   for (const [field, column] of [
-    ['status', 'status'],
-    ['department', 'department'],
-    ['assignedEmployee', 'assigned_employee'],
+    ['status', 'tasks.status'],
+    ['department', 'tasks.department'],
+    ['assignedEmployee', 'tasks.assigned_employee'],
   ]) {
     if (filters[field] !== undefined) {
       conditions.push(`${column} = ?`)
@@ -193,11 +200,11 @@ export function listTasks(filters = {}) {
     ? Math.max(1, Math.min(filters.limit, 100))
     : 50
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
-
   return db.prepare(`
-    SELECT * FROM tasks ${where}
-    ORDER BY created_at DESC
+    SELECT tasks.*
+    FROM tasks
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY tasks.created_at DESC
     LIMIT ?
   `).all(...values, limit)
 }

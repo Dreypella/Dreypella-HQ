@@ -43,3 +43,7 @@ dist-ssr
 
 # Local pre-change copies
 *.pre-*
+
+# Local backups and rollback copies
+
+backups/
